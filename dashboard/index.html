@@ -105,29 +105,31 @@ async function fetchFirebase() {
   const r = await fetch(`${base}/readings/${encodeURIComponent($('device').value)}.json?orderBy=${q}&limitToLast=240`);
   if (!r.ok) throw new Error('Firebase HTTP ' + r.status + ' (check URL and database rules)');
   const obj = await r.json();
-  return Object.values(obj || {}).filter(x => x && x.ts).sort((a, b) => a.ts - b.ts);
+  const num = v => typeof v === 'number' && isFinite(v);
+  return Object.values(obj || {}).filter(x => x && num(x.ts) && num(x.power_w)).sort((a, b) => a.ts - b.ts);
 }
 
 // ---- analytics (cloud-layer calculations) ----
 function analyze(rows) {
   const ef = parseFloat($('ef').value) || 0.71, baseW = parseFloat($('base').value) || 100;
-  let kwh = 0, idle = 0; const cum = [0];
+  let kwh = 0, idle = 0, hours = 0; const cum = [0], xs = [0];
   for (let i = 1; i < rows.length; i++) {
-    const dtH = (rows[i].ts - rows[i-1].ts) / 3.6e6;
-    const e = dtH < 5/60 ? rows[i].power_w * dtH / 1000 : 0;       // ignore gaps > 5 min
-    kwh += e; if (rows[i].idle_waste) idle += e; cum.push(kwh);
+    const dtH = (rows[i].ts - rows[i-1].ts) / 3.6e6, gap = dtH >= 5/60;
+    const e = gap ? 0 : rows[i].power_w * dtH / 1000;               // ignore gaps > 5 min
+    if (!gap) hours += dtH;                                          // ...and drop their time too
+    kwh += e; if (rows[i].idle_waste) idle += e; cum.push(kwh); xs.push(hours);
   }
-  const hours = rows.length > 1 ? (rows[rows.length-1].ts - rows[0].ts) / 3.6e6 : 0;
   const avgW = hours > 0 ? kwh / hours * 1000 : 0;
   const idleRatio = kwh > 0 ? idle / kwh : 0;
   // gas baseline = median of first 10 readings; compare with mean of last 5
-  const g = rows.map(r => r.gas_raw), first = g.slice(0, 10).sort((a,b)=>a-b);
-  const gBase = first[Math.floor(first.length/2)] || 1, gNow = g.slice(-5).reduce((a,b)=>a+b,0) / Math.min(5, g.length);
-  const gasPen = clamp(((gNow - gBase) / gBase) / 0.5, 0, 1);
+  const g = rows.map(r => r.gas_raw), ok = v => typeof v === 'number' && v > 0;   // missing/zero gas readings are ignored
+  const first = g.slice(0, 10).filter(ok).sort((a,b)=>a-b), recent = g.slice(-5).filter(ok);
+  const gBase = first[Math.floor(first.length/2)], gNow = recent.reduce((a,b)=>a+b,0) / recent.length;
+  const gasPen = gBase > 0 && gNow > 0 ? clamp(((gNow - gBase) / gBase) / 0.5, 0, 1) : 0;
   const over = clamp((avgW - baseW) / baseW, 0, 1);
   const score = Math.round(clamp(100 - 60*idleRatio - 25*over - 15*gasPen, 0, 100));
   // linear regression: cumulative kWh vs hours -> slope (kW) -> 30-day projection
-  const xs = rows.map(r => (r.ts - rows[0].ts) / 3.6e6), n = xs.length;
+  const n = xs.length;
   const mx = xs.reduce((a,b)=>a+b,0)/n, my = cum.reduce((a,b)=>a+b,0)/n;
   let sxy = 0, sxx = 0; for (let i = 0; i < n; i++) { sxy += (xs[i]-mx)*(cum[i]-my); sxx += (xs[i]-mx)**2; }
   const slope = sxx > 0 ? sxy / sxx : 0, icpt = my - slope*mx;
@@ -177,7 +179,7 @@ function render(rows) {
   $('occ').textContent = last.occupied ? 'Occupied' : 'Empty';
   $('relay').textContent = 'Relay: ' + (last.relay_on ? 'ON' : 'OFF');
   $('th').textContent = last.temp.toFixed(1) + '° / ' + last.hum.toFixed(0) + '%';
-  $('gas').textContent = 'Gas raw: ' + last.gas_raw;
+  $('gas').textContent = 'Gas raw: ' + (last.gas_raw ?? 'n/a');
   $('recs').innerHTML = recommendations(a, last).map(t => '<li>' + t + '</li>').join('') || '<li>No issues detected.</li>';
   setChart(charts.p, labels, rows.map(r => r.power_w));
   setChart(charts.th, labels, rows.map(r => r.temp), rows.map(r => r.hum));

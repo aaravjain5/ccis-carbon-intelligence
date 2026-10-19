@@ -35,10 +35,12 @@
 const float DIV_FACTOR   = 1.5;     // 1/(20k/(10k+20k)) = 1.5
 const float ACS_MV_PER_A = 100.0;   // 20A variant = 100 mV/A (NOT 185)
 const float MAINS_V      = 230.0;   // assumed RMS mains voltage
+const float DC_TEST_V    = 12.0;    // supply voltage of the DC test load (LOAD_IS_AC = false)
 const float POWER_FACTOR = 1.0;     // 1.0 for resistive loads (bulb/heater)
 const float CURRENT_DEADBAND = 0.15;// A, below this = treated as zero
 const bool  LOAD_IS_AC   = true;    // false if testing with a DC load
 const unsigned long SEND_MS = 15000;
+const unsigned long WIFI_RETRY_MS = 10000; // min gap between non-blocking reconnect attempts
 const unsigned long IDLE_AFTER_MS = 5UL * 60UL * 1000UL; // no motion for 5 min
 
 DHT dht(PIN_DHT, DHT22);
@@ -55,13 +57,15 @@ float readAcsMvAvg(int n = 500) {
 
 float readCurrentA() {
   if (LOAD_IS_AC) {                       // RMS over 10 mains cycles (200 ms @ 50 Hz)
-    double sumSq = 0; int n = 0;
+    double sum = 0, sumSq = 0; int n = 0;
     unsigned long t0 = millis();
     while (millis() - t0 < 200) {
-      float mv = analogReadMilliVolts(PIN_ACS) * DIV_FACTOR - acsOffsetMv;
-      sumSq += mv * mv; n++;
+      float mv = analogReadMilliVolts(PIN_ACS) * DIV_FACTOR;
+      sum += mv; sumSq += (double)mv * mv; n++;
     }
-    float i = sqrt(sumSq / n) / ACS_MV_PER_A;
+    // AC component only (std-dev about this window's own mean), so a drifting zero point adds no phantom current
+    double mean = sum / n;
+    float i = sqrt(max(sumSq / n - mean * mean, 0.0)) / ACS_MV_PER_A;
     return (i < CURRENT_DEADBAND) ? 0 : i;
   } else {                                // DC: average then subtract offset
     float i = fabs(readAcsMvAvg(300) - acsOffsetMv) / ACS_MV_PER_A;
@@ -85,8 +89,11 @@ void connectWiFi() {
 }
 
 bool postJson(const String& body) {
-  if (WiFi.status() != WL_CONNECTED) connectWiFi();
-  if (WiFi.status() != WL_CONNECTED) return false;
+  if (WiFi.status() != WL_CONNECTED) {    // never block loop(): the PIR must keep being polled during an outage
+    static unsigned long lastRetry = 0;
+    if (millis() - lastRetry >= WIFI_RETRY_MS) { lastRetry = millis(); WiFi.disconnect(); WiFi.begin(WIFI_SSID, WIFI_PASS); }
+    return false;
+  }
   WiFiClientSecure client;
   client.setInsecure();                   // demo only; pin a certificate for production
   HTTPClient http;
@@ -118,6 +125,10 @@ void setup() {
   delay(1000);
   acsOffsetMv = readAcsMvAvg(1000);
   Serial.printf("ACS offset = %.1f mV (expect ~2500)\n", acsOffsetMv);
+#if USE_RELAY
+  relayOn = true;                         // load energised now that calibration is done
+  digitalWrite(PIN_RELAY, LOW);
+#endif
   Serial.println("PIR warm-up 30 s...");
   delay(30000);
   connectWiFi();
@@ -138,7 +149,7 @@ void loop() {
 
     int gas = readGasRaw();
     float amps = readCurrentA();
-    float watts = amps * MAINS_V * POWER_FACTOR;
+    float watts = LOAD_IS_AC ? amps * MAINS_V * POWER_FACTOR : amps * DC_TEST_V;
     bool occupied = (millis() - lastMotion) < IDLE_AFTER_MS;
     bool idleWaste = (watts > 1.0) && !occupied;
 
@@ -147,8 +158,10 @@ void loop() {
     if (idleWaste) kwhIdle += dk;
 
 #if USE_RELAY
-    // Optional auto-cutoff: appliance running while room empty
-    relayOn = !idleWaste;
+    // Optional auto-cutoff: appliance running while room empty. Latched: once cut, stay off until
+    // motion returns (otherwise 0 W -> no idle waste -> relay turns back on -> chatter every cycle).
+    if (occupied) relayOn = true;
+    else if (idleWaste) relayOn = false;
     digitalWrite(PIN_RELAY, relayOn ? LOW : HIGH);
 #endif
 

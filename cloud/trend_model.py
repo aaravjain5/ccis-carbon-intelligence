@@ -12,24 +12,32 @@ def fetch(url, device):
         data = json.load(r) or {}
     return sorted((v for v in data.values() if v and "ts" in v), key=lambda v: v["ts"])
 
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and np.isfinite(v)
+
 def analyze(rows, ef, baseline_w):
+    rows = [r for r in rows if _num(r.get("ts")) and _num(r.get("power_w"))]   # drop unusable rows
+    if len(rows) < 2:
+        raise ValueError("Need at least 2 valid readings")
     ts = np.array([r["ts"] for r in rows], dtype=float)
     p = np.array([r["power_w"] for r in rows], dtype=float)
     idle = np.array([r.get("idle_waste", 0) for r in rows], dtype=float)
-    gas = np.array([r["gas_raw"] for r in rows], dtype=float)
+    gas = np.array([r["gas_raw"] if _num(r.get("gas_raw")) and r["gas_raw"] > 0 else np.nan for r in rows])
     dt_h = np.diff(ts) / 3.6e6
     dt_h[dt_h > 5 / 60] = 0                       # ignore gaps longer than 5 min
     e = p[1:] * dt_h / 1000                       # kWh per interval
     kwh, idle_kwh = e.sum(), (e * idle[1:]).sum()
-    hours = (ts[-1] - ts[0]) / 3.6e6
+    active = np.concatenate([[0], np.cumsum(dt_h)])   # elapsed hours with gaps removed, to match the energy
+    hours = active[-1]
     avg_w = kwh / hours * 1000 if hours > 0 else 0
-    gas_base = np.median(gas[:10]); gas_now = gas[-5:].mean()
+    g0, g1 = gas[:10][np.isfinite(gas[:10])], gas[-5:][np.isfinite(gas[-5:])]
+    gas_base = np.median(g0) if g0.size else 0; gas_now = g1.mean() if g1.size else 0   # missing/zero gas -> no penalty
     idle_ratio = idle_kwh / kwh if kwh > 0 else 0
     over = min(max((avg_w - baseline_w) / baseline_w, 0), 1)
-    gas_pen = min(max((gas_now - gas_base) / gas_base / 0.5, 0), 1)
+    gas_pen = min(max((gas_now - gas_base) / gas_base / 0.5, 0), 1) if gas_base > 0 and gas_now > 0 else 0
     score = round(float(np.clip(100 - 60 * idle_ratio - 25 * over - 15 * gas_pen, 0, 100)))
     cum = np.concatenate([[0], np.cumsum(e)])
-    x = ((ts - ts[0]) / 3.6e6).reshape(-1, 1)
+    x = active.reshape(-1, 1)
     model = LinearRegression().fit(x, cum)
     month_kwh = max(model.coef_[0], 0) * 24 * 30
     return dict(readings=len(rows), kwh=kwh, idle_kwh=idle_kwh, co2_kg=kwh * ef, avg_w=avg_w,
